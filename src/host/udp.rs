@@ -6,6 +6,7 @@ use tokio::time::{sleep, Duration}; // as TokioMutex;
                                     // Tracing for logging
 use tracing::*;
 // Postcard is the default de/serializer
+use crate::error::Error;
 use postcard::*;
 // Multi-threading primitives
 use std::sync::Arc;
@@ -45,8 +46,10 @@ pub async fn process_udp(
                 };
 
                 match msg.msg_type {
-                    MsgType::Error(e) => {
-                        todo!();
+                    MsgType::Result(result) => {
+                        if let Err(e) = result {
+                            error!("{}", e);
+                        }
                     }
                     MsgType::Set => {
                         info!("Received SET message: {:?}", &msg);
@@ -71,12 +74,18 @@ pub async fn process_udp(
 
                         if let Ok(topic) = tree.last() {
                             let return_bytes = match topic {
-                                Some(msg) => msg.1,
+                                Some(msg) => {
+                                    let b = msg.1.to_vec();
+                                    b
+                                }
                                 None => {
                                     let e: String =
                                         format!("Error: no topic \"{}\" exists", &msg.topic);
                                     error!("{}", &e);
-                                    e.as_bytes().into()
+                                    // e.as_bytes().into();
+                                    GenericMsg::result(Err(Error::NonExistentTopic(msg.topic)))
+                                        .as_bytes()
+                                        .unwrap()
                                 }
                             };
 
@@ -95,13 +104,8 @@ pub async fn process_udp(
                         match tree.iter().nth_back(n) {
                             Some(topic) => {
                                 let return_bytes = match topic {
-                                    Ok((_timestamp, bytes)) => bytes,
-                                    Err(e) => {
-                                        let e: String =
-                                            format!("Error: no topic \"{}\" exists", &msg.topic);
-                                        error!("{}", &e);
-                                        e.as_bytes().into()
-                                    }
+                                    Ok((_timestamp, bytes)) => bytes.to_vec(),
+                                    Err(e) => GenericMsg::result(Err(e.into())).as_bytes().unwrap(),
                                 };
 
                                 if let Ok(()) = s.writable().await {

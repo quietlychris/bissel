@@ -12,7 +12,7 @@ use std::sync::Arc;
 // Misc other imports
 use chrono::Utc;
 
-use crate::error::Error;
+use crate::error::{Error, HostOperation};
 use crate::host::GenericStore;
 use crate::prelude::*;
 use std::convert::TryInto;
@@ -43,7 +43,7 @@ pub async fn handshake(
 /// Host process for handling incoming connections from Nodes
 #[tracing::instrument(skip_all)]
 #[inline]
-pub async fn process_tcp(stream: TcpStream, db: sled::Db, max_buffer_size: usize) {
+pub async fn process_tcp(stream: TcpStream, mut db: sled::Db, max_buffer_size: usize) {
     let mut buf = vec![0u8; max_buffer_size];
     loop {
         if let Err(e) = stream.readable().await {
@@ -75,14 +75,43 @@ pub async fn process_tcp(stream: TcpStream, db: sled::Db, max_buffer_size: usize
                     MsgType::Subscribe => {
                         start_subscription(msg.clone(), db.clone(), &stream).await;
                     }
+                    MsgType::Get => {
+                        let response = match db.get_generic_nth(&msg.topic, 0) {
+                            Ok(g) => g,
+                            Err(e) => GenericMsg::result(Err(e)),
+                        };
+                        if let Ok(return_bytes) = response.as_bytes() {
+                            if let Ok(()) = stream.writable().await {
+                                if let Err(e) = stream.try_write(&return_bytes) {
+                                    error!("Error sending data back on TCP/TOPICS: {:?}", e);
+                                }
+                            }
+                        }
+
+                        continue;
+                    }
+                    MsgType::Set => {
+                        let response = GenericMsg::result(db.insert_generic(msg));
+                        if let Ok(return_bytes) = response.as_bytes() {
+                            if let Ok(()) = stream.writable().await {
+                                if let Err(e) = stream.try_write(&return_bytes) {
+                                    error!("Error sending data back on TCP/TOPICS: {:?}", e);
+                                }
+                            }
+                        }
+
+                        continue;
+                    }
                     _ => {
                         let msg = process_msg(msg.clone(), db.clone()).unwrap();
                     }
                 }
 
                 match &msg.msg_type {
-                    MsgType::Error(e) => {
-                        todo!()
+                    MsgType::Result(result) => {
+                        if let Err(e) = result {
+                            error!("{}", e);
+                        }
                     }
                     MsgType::Set => {
                         // println!("received {} bytes, to be assigned to: {}", n, &msg.name);
@@ -96,7 +125,7 @@ pub async fn process_tcp(stream: TcpStream, db: sled::Db, max_buffer_size: usize
                                     info!("{:?}", msg.data);
                                     Ok(())
                                 }
-                                Err(e) => Err(crate::error::HostOperation::FAILURE),
+                                Err(e) => Err(HostOperation::FAILURE),
                             }
                         };
 
@@ -121,12 +150,18 @@ pub async fn process_tcp(stream: TcpStream, db: sled::Db, max_buffer_size: usize
 
                         if let Ok(topic) = tree.last() {
                             let return_bytes = match topic {
-                                Some(msg) => msg.1,
+                                Some(msg) => {
+                                    let b = msg.1.to_vec();
+                                    b
+                                }
                                 None => {
                                     let e: String =
                                         format!("Error: no topic \"{}\" exists", &msg.topic);
                                     error!("{}", &e);
-                                    e.as_bytes().into()
+                                    // e.as_bytes().into();
+                                    GenericMsg::result(Err(Error::NonExistentTopic(msg.topic)))
+                                        .as_bytes()
+                                        .unwrap()
                                 }
                             };
 
